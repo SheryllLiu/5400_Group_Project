@@ -35,6 +35,8 @@ OUT_FILE = OUT_DIR / "cleaned_data.csv"
 TOPIC_COLUMN = "topic"
 TEXT_COLUMN = "text"
 CLEANED_COLUMN = "cleaned_document"
+# Raw text columns to carry through unchanged so the retriever can display them.
+RAW_TEXT_COLUMNS = ("title", "section", "text")
 
 # English stopwords — vendored from the NLTK English list so this module has
 # no runtime download step. If you prefer NLTK, swap this set for
@@ -70,6 +72,100 @@ STOPWORDS: frozenset[str] = frozenset({
 # ``sevp-certified`` stay intact.
 _STRIP_PUNCT = re.compile(r"[^a-z0-9\s-]+")
 _COLLAPSE_WS = re.compile(r"\s+")
+
+# ---------------------------------------------------------------------------
+# Query-side term normalization
+# ---------------------------------------------------------------------------
+# Maps what a user might type → the canonical form present in the corpus.
+#
+# Section A (up to "sevp-certified"): unhyphenated user variants → hyphenated
+#   corpus tokens (e.g. "f1" → "f-1", "on campus" → "on-campus").
+# Section B: common abbreviations → the full phrases indexed in the corpus
+#   (e.g. "opt" → "optional practical training").
+#
+# Patterns are applied longest-first so "my e verify" is consumed before
+# the shorter "e verify" key can fire on the same span.
+QUERY_TERM_NORMALIZATION: dict[str, str] = {
+    # --- Section A: visa / status codes ---
+    "f1": "f-1",          "f 1": "f-1",
+    "f2": "f-2",          "f 2": "f-2",
+    "m1": "m-1",          "m 1": "m-1",
+    "m2": "m-2",          "m 2": "m-2",
+    "j1": "j-1",          "j 1": "j-1",
+    "j2": "j-2",          "j 2": "j-2",
+    "b1": "b-1",          "b 1": "b-1",
+    "b2": "b-2",          "b 2": "b-2",
+    "h1b": "h-1b",        "h 1b": "h-1b",
+    "h 1 b": "h-1b",      "h1-b": "h-1b",
+    # --- Section A: USCIS / DHS form numbers ---
+    "i20": "i-20",        "i 20": "i-20",
+    "i94": "i-94",        "i 94": "i-94",
+    "i901": "i-901",      "i 901": "i-901",
+    "i515": "i-515",      "i 515": "i-515",
+    "i515a": "i-515a",    "i 515a": "i-515a",
+    "i539": "i-539",      "i 539": "i-539",
+    "i765": "i-765",      "i 765": "i-765",
+    "i766": "i-766",      "i 766": "i-766",
+    "i797": "i-797",      "i 797": "i-797",
+    "i797a": "i-797a",    "i 797a": "i-797a",
+    "i129": "i-129",      "i 129": "i-129",
+    "i290b": "i-290b",    "i 290b": "i-290b",
+    "i983": "i-983",      "i 983": "i-983",
+    "i9": "i-9",          "i 9": "i-9",
+    "i17": "i-17",        "i 17": "i-17",
+    "w7": "w-7",          "w 7": "w-7",
+    "ds2019": "ds-2019",  "ds 2019": "ds-2019",
+    "ssa l676": "ssa-l676",
+    # --- Section A: compound terms (space-separated → hyphenated) ---
+    "cap gap": "cap-gap",
+    "pre completion": "pre-completion",
+    "post completion": "post-completion",
+    "on campus": "on-campus",
+    "off campus": "off-campus",
+    "post secondary": "post-secondary",
+    "full time": "full-time",
+    "part time": "part-time",
+    "up to date": "up-to-date",
+    "my e verify": "mye-verify",
+    "e verify": "e-verify",
+    "everify": "e-verify",
+    "re enter": "re-enter",
+    "re entry": "re-entry",
+    "transfer in": "transfer-in",
+    "transfer out": "transfer-out",
+    "k 12": "k-12",
+    "sevp certified": "sevp-certified",
+    # --- Section B: abbreviations → full phrases used in the corpus ---
+    "ssn": "social security number",
+    "dso": "designated school official",
+    "dsos": "designated school officials",
+    "sevis": "student exchange visitor information system",
+    "sevp": "student exchange visitor program",
+    "uscis": "united states citizenship immigration services",
+    "cbp": "customs border protection",
+    "dhs": "department homeland security",
+    "irs": "internal revenue service",
+    "itin": "individual taxpayer identification number",
+    "opt": "optional practical training",
+    "cpt": "curricular practical training",
+    "ead": "employment authorization document",
+    "ssa": "social security administration",
+    "dmv": "department motor vehicles",
+}
+
+# Pre-compiled patterns (longest source phrase first) with hyphen-aware word
+# boundaries so "ssa" does not fire inside "ssa-l676".
+_NORM_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(
+            r"(?<![a-zA-Z0-9-])" + re.escape(src) + r"(?![a-zA-Z0-9-])"
+        ),
+        dst,
+    )
+    for src, dst in sorted(
+        QUERY_TERM_NORMALIZATION.items(), key=lambda kv: -len(kv[0])
+    )
+]
 
 
 def normalize_text(text: str) -> str:
@@ -115,27 +211,68 @@ def clean_document_row(row: pd.Series, text_columns: list[str]) -> str:
     return clean_text(merged)
 
 
+def normalize_query_terms(text: str) -> str:
+    """Normalize immigration-domain terminology before the main cleaning step.
+
+    Lowercases ``text`` then applies :data:`QUERY_TERM_NORMALIZATION` patterns
+    (longest-first) so that:
+
+    * Unhyphenated variants become the hyphenated corpus tokens
+      (``f1`` → ``f-1``, ``on campus`` → ``on-campus``).
+    * Common abbreviations expand to the full phrase in the index
+      (``opt`` → ``optional practical training``).
+
+    Hyphens are used as word-boundary guards so ``ssa`` never fires inside
+    ``ssa-l676``.
+    """
+    text = text.lower()
+    for pattern, replacement in _NORM_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def clean_query_text(query: str) -> str:
-    """Clean a single user query with the exact rules used on the corpus.
+    """Normalize terms then clean with the same rules used on the corpus.
 
     Returns a space-joined string of tokens. Call ``.split()`` downstream if
     you want a token list for BM25.
     """
     if not isinstance(query, str):
         return ""
-    return clean_text(query)
+    return clean_text(normalize_query_terms(query))
 
 
 def build_cleaned_corpus(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a DataFrame with ``[topic, cleaned_document]``."""
+    """Return a DataFrame with cleaned and original text columns.
+
+    Output columns (in order):
+    - ``topic``            — unchanged
+    - ``title``            — raw, if present in input
+    - ``section``          — raw, if present in input
+    - ``text``             — raw, if present in input
+    - ``raw_document``     — title + section + text joined by newlines (non-empty parts only)
+    - ``cleaned_document`` — normalized text used for BM25 indexing
+    """
     if TOPIC_COLUMN not in df.columns:
         raise ValueError(f"input CSV must contain a '{TOPIC_COLUMN}' column")
     text_cols = [c for c in df.columns if c != TOPIC_COLUMN]
     cleaned = df.apply(lambda r: clean_document_row(r, text_cols), axis=1)
-    return pd.DataFrame({
-        TOPIC_COLUMN: df[TOPIC_COLUMN].fillna("").astype(str),
-        CLEANED_COLUMN: cleaned,
-    })
+
+    present_raw = [c for c in RAW_TEXT_COLUMNS if c in df.columns]
+
+    out = pd.DataFrame({TOPIC_COLUMN: df[TOPIC_COLUMN].fillna("").astype(str)})
+
+    for col in present_raw:
+        out[col] = df[col].fillna("").astype(str)
+
+    if present_raw:
+        out["raw_document"] = df.apply(
+            lambda r: "\n".join(str(r[c]) for c in present_raw if str(r[c]).strip()),
+            axis=1,
+        )
+
+    out[CLEANED_COLUMN] = cleaned
+    return out
 
 
 def main() -> None:

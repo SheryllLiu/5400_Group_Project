@@ -48,16 +48,23 @@ PAGE = """<!doctype html>
         {% for r in results %}
           <li>
             <p>
-              <strong>score:</strong> {{ '%.4f' % r.score }}
+              <strong>final_score:</strong> {{ '%.4f' % r.final_score }}
               &nbsp;<strong>doc_id:</strong> {{ r.doc_id }}
               &nbsp;<strong>topic:</strong> {{ r.topic|e }}
+            </p>
+            <p>
+              <small>
+                <strong>bm25_topic:</strong> {{ '%.4f' % r.bm25_topic }}
+                &nbsp;<strong>bm25_title:</strong> {{ '%.4f' % r.bm25_title }}
+                &nbsp;<strong>bm25_text:</strong> {{ '%.4f' % r.bm25_text }}
+              </small>
             </p>
             {% if r.title %}<p><strong>title:</strong> {{ r.title|e }}</p>{% endif %}
             {% if r.section %}<p><strong>section:</strong> {{ r.section|e }}</p>{% endif %}
             {% if r.text %}
               <p><strong>text:</strong> {{ r.text|e }}</p>
-            {% else %}
-              <p><strong>cleaned_document:</strong> {{ r.cleaned_document|e }}</p>
+            {% elif r.raw_document %}
+              <p><strong>text:</strong> {{ r.raw_document|e }}</p>
             {% endif %}
           </li>
         {% endfor %}
@@ -78,7 +85,7 @@ def index():
         submitted = True
         query = (request.form.get("query") or "").strip()
         if query:
-            results = retriever.search(query, top_k=2)
+            results = retriever.search(query, top_k=3)
     return render_template_string(
         PAGE, query=query, results=results, submitted=submitted
     )

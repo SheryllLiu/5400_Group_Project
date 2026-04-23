@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 
 import hashlib
 import posixpath
+import re
 import requests
 import time
 from bs4 import BeautifulSoup
 
-RAW_DIR = Path("../../data/raw")
+RAW_DIR = Path("data/raw")
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 # Define seed URLs for crawling 
@@ -113,6 +114,28 @@ def extract_links(html: str, base_url: str) -> list[str]:
         out.add(normalize_url(urljoin(base_url, href)))
     return list(out)
 
+def _canonical_url(soup: BeautifulSoup) -> str | None:
+    """Return the page's <link rel="canonical"> href, or None."""
+    link = soup.find("link", rel="canonical")
+    if link is None:
+        return None
+    href = (link.get("href") or "").strip()
+    return href or None
+
+
+def _article_hash(soup: BeautifulSoup) -> str | None:
+    """SHA-256 of the <article> visible text, whitespace-collapsed.
+
+    Hashing only the article body means cosmetic differences in nav / analytics
+    markup don't defeat dedup for pages whose real content is identical.
+    """
+    article = soup.find("article")
+    if article is None:
+        return None
+    text = re.sub(r"\s+", " ", article.get_text(" ", strip=True)).strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None
+
+
 # save raw HTML
 def save_page(url: str, html: str, meta_extra: dict) -> None:
     url = normalize_url(url)
@@ -141,6 +164,10 @@ def crawl_seed(seed: dict) -> None:
     visited: set[str] = set()
     queue: deque = deque([(seed_url, 0, None)])
     saved = 0
+    # Layer-1: canonical URL dedup (first-win).
+    seen_canonicals: dict[str, str] = {}
+    # Layer-2: article content-hash dedup (first-win).
+    seen_hashes: dict[str, str] = {}
 
     print(f"\n=== {seed_url}")
     print(f"    depth<={MAX_DEPTH}, max_pages={MAX_PAGES_PER_SEED}, prefix={path_prefix}")
@@ -162,6 +189,22 @@ def crawl_seed(seed: dict) -> None:
         if resp is None:
             continue
 
+        # --- dedup checks (parse once, reuse soup) ---
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        canonical = _canonical_url(soup)
+        if canonical and canonical in seen_canonicals:
+            print(f"   skip duplicate (canonical): {url} == {seen_canonicals[canonical]}")
+            time.sleep(DELAY_SEC)
+            continue
+
+        body_hash = _article_hash(soup)
+        if body_hash and body_hash in seen_hashes:
+            print(f"   skip duplicate (content hash): {url} == {seen_hashes[body_hash]}")
+            time.sleep(DELAY_SEC)
+            continue
+        # --- end dedup ---
+
         save_page(url, resp.text, {
             "depth": depth,
             "parent_url": parent,
@@ -176,6 +219,10 @@ def crawl_seed(seed: dict) -> None:
             "institution_specific": seed.get("institution_specific", False),
         })
         saved += 1
+        if canonical:
+            seen_canonicals[canonical] = url
+        if body_hash:
+            seen_hashes[body_hash] = url
 
         if depth < MAX_DEPTH:
             for link in extract_links(resp.text, url):
