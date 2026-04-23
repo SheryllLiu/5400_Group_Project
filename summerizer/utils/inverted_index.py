@@ -1,20 +1,24 @@
-"""Build an inverted index + BM25 statistics from the cleaned corpus.
+"""Build per-field BM25 indexes from the cleaned corpus.
 
-Reads ``data/processed/cleaned_data.csv``, tokenizes each row's
-``cleaned_document`` column on whitespace, and pickles a single dict
-containing:
+Reads ``data/processed/cleaned_data.csv`` and builds three independent BM25
+indexes — one for each of ``topic``, ``title``, ``text``. Each field gets its
+own inverted index, doc lengths, doc frequencies, idf table, and avgdl, so
+short fields (``topic``, ``title``) are length-normalized against other short
+fields rather than against the much longer body text.
 
-* ``inverted_index``  — ``term -> [(doc_id, tf), ...]``
-* ``doc_len``          — ``doc_id -> int``
-* ``doc_freq``         — ``term -> df``
-* ``idf``              — precomputed ``term -> float`` using the standard
-                         BM25 idf formula
-* ``avgdl``, ``N``     — corpus-level stats
-* ``k1``, ``b``        — BM25 constants (defaults 1.5 / 0.75)
-* ``doc_store``        — ``doc_id -> {topic, cleaned_document, ...}`` so the
-                         retriever can return human-readable results; any
-                         extra columns present in the CSV (e.g. title,
-                         section, text) are copied over verbatim.
+The pickled output at ``data/processed/indexes/bm25_index.pkl`` has the shape::
+
+    {
+        "fields": {
+            "topic": {inverted_index, doc_len, doc_freq, idf, avgdl, N},
+            "title": {...},
+            "text":  {...},
+        },
+        "k1": 1.5,
+        "b":  0.3,
+        "doc_store": {doc_id: {topic, title, section, text, raw_document, ...}},
+        "N": <total docs>,
+    }
 
 Run from the repo root::
 
@@ -30,47 +34,64 @@ from typing import Any
 
 import pandas as pd
 
+from utils.text_cleaning import clean_text
+
 IN_FILE = Path("data/processed/cleaned_data.csv")
 OUT_DIR = Path("data/processed/indexes")
 OUT_FILE = OUT_DIR / "bm25_index.pkl"
 
 DEFAULT_K1 = 1.5
-DEFAULT_B = 0.75
+DEFAULT_B = 0.3
 
-CLEANED_COLUMN = "cleaned_document"
-TOPIC_COLUMN = "topic"
+# Fields that get their own BM25 index. Each is cleaned with the same
+# pipeline used on queries so token surfaces match.
+INDEXED_FIELDS = ("topic", "title", "text")
 
 
-def tokenize_document(text: str) -> list[str]:
-    """Whitespace-split a cleaned document into tokens.
-
-    The corpus has already been normalized by ``utils.text_cleaning``, so
-    splitting on whitespace is sufficient — no re-tokenization here.
-    """
-    if not isinstance(text, str) or not text:
+def tokenize_field(raw: Any) -> list[str]:
+    """Clean a raw field value with the shared pipeline, then whitespace-split."""
+    if not isinstance(raw, str) or not raw:
         return []
-    return text.split()
+    cleaned = clean_text(raw)
+    return cleaned.split() if cleaned else []
 
 
 def compute_idf(doc_freq: dict[str, int], N: int) -> dict[str, float]:
-    """Precompute BM25 idf for every term.
-
-    Uses the standard BM25 idf, which is non-negative for all df ≥ 1::
-
-        idf(t) = log(1 + (N - df + 0.5) / (df + 0.5))
-    """
+    """Standard BM25 idf, non-negative for all df ≥ 1."""
     return {
         term: math.log(1 + (N - df + 0.5) / (df + 0.5))
         for term, df in doc_freq.items()
     }
 
 
-def _row_to_store_entry(row: pd.Series, columns: list[str]) -> dict[str, Any]:
-    """Snapshot one DataFrame row into a plain dict for the doc_store.
+def build_field_index(tokens_by_doc: dict[int, list[str]]) -> dict[str, Any]:
+    """Build one BM25 sub-index from ``doc_id -> tokens``."""
+    inverted_index: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    doc_len: dict[int, int] = {}
+    doc_freq: dict[str, int] = defaultdict(int)
 
-    NaNs are coerced to empty strings so downstream consumers don't have to
-    special-case missing metadata.
-    """
+    for doc_id, tokens in tokens_by_doc.items():
+        doc_len[doc_id] = len(tokens)
+        for term, tf in Counter(tokens).items():
+            inverted_index[term].append((doc_id, tf))
+            doc_freq[term] += 1
+
+    N = len(tokens_by_doc)
+    idf = compute_idf(dict(doc_freq), N)
+    total_len = sum(doc_len.values())
+    avgdl = (total_len / N) if N else 0.0
+
+    return {
+        "inverted_index": dict(inverted_index),
+        "doc_len": doc_len,
+        "doc_freq": dict(doc_freq),
+        "idf": idf,
+        "avgdl": avgdl,
+        "N": N,
+    }
+
+
+def _row_to_store_entry(row: pd.Series, columns: list[str]) -> dict[str, Any]:
     entry: dict[str, Any] = {}
     for col in columns:
         val = row[col]
@@ -78,57 +99,38 @@ def _row_to_store_entry(row: pd.Series, columns: list[str]) -> dict[str, Any]:
     return entry
 
 
-def build_inverted_index(
+def build_indexes(
     df: pd.DataFrame,
     k1: float = DEFAULT_K1,
     b: float = DEFAULT_B,
 ) -> dict[str, Any]:
-    """Build the full inverted index + BM25 stats from a DataFrame.
-
-    Each row becomes one document; ``doc_id`` is the row's 0-based position
-    after ``reset_index``. The returned dict is directly picklable.
-    """
-    if CLEANED_COLUMN not in df.columns:
-        raise ValueError(
-            f"input DataFrame is missing required column '{CLEANED_COLUMN}'"
-        )
-
+    """Build per-field BM25 indexes + a shared doc_store."""
     df = df.reset_index(drop=True)
     N = len(df)
-
-    inverted_index: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    doc_len: dict[int, int] = {}
-    doc_freq: dict[str, int] = defaultdict(int)
-    doc_store: dict[int, dict[str, Any]] = {}
-
     store_columns = list(df.columns)
 
+    tokens_per_field: dict[str, dict[int, list[str]]] = {
+        f: {} for f in INDEXED_FIELDS
+    }
+    doc_store: dict[int, dict[str, Any]] = {}
+
     for doc_id, row in df.iterrows():
-        tokens = tokenize_document(row.get(CLEANED_COLUMN, ""))
-        doc_len[doc_id] = len(tokens)
-
-        term_counts = Counter(tokens)
-        for term, tf in term_counts.items():
-            inverted_index[term].append((doc_id, tf))
-            doc_freq[term] += 1
-
+        for field in INDEXED_FIELDS:
+            raw = row.get(field, "")
+            tokens_per_field[field][doc_id] = tokenize_field(raw)
         doc_store[doc_id] = _row_to_store_entry(row, store_columns)
 
-    inverted_index = dict(inverted_index)
-    doc_freq = dict(doc_freq)
-    idf = compute_idf(doc_freq, N)
-    avgdl = (sum(doc_len.values()) / N) if N else 0.0
+    fields = {
+        field: build_field_index(tokens_per_field[field])
+        for field in INDEXED_FIELDS
+    }
 
     return {
-        "inverted_index": inverted_index,
-        "doc_len": doc_len,
-        "doc_freq": doc_freq,
-        "idf": idf,
-        "avgdl": avgdl,
-        "N": N,
+        "fields": fields,
         "k1": k1,
         "b": b,
         "doc_store": doc_store,
+        "N": N,
     }
 
 
@@ -147,13 +149,14 @@ def main() -> None:
     if not IN_FILE.exists():
         raise FileNotFoundError(f"input not found: {IN_FILE}")
     df = pd.read_csv(IN_FILE, keep_default_na=False)
-    index = build_inverted_index(df)
+    index = build_indexes(df)
     save_index(index, OUT_FILE)
-    print(
-        f"[ok] indexed N={index['N']} docs, "
-        f"|V|={len(index['inverted_index'])} unique terms, "
-        f"avgdl={index['avgdl']:.2f} -> {OUT_FILE}"
-    )
+    parts = []
+    for field, sub in index["fields"].items():
+        parts.append(
+            f"{field}: |V|={len(sub['inverted_index'])}, avgdl={sub['avgdl']:.2f}"
+        )
+    print(f"[ok] N={index['N']} docs; " + "; ".join(parts) + f" -> {OUT_FILE}")
 
 
 if __name__ == "__main__":
