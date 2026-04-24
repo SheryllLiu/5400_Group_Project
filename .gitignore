@@ -26,9 +26,7 @@ htmlcov/
 
 # Crawled data and indexes (large / regenerable)
 data/cache/
-*.pkl
 *.joblib
-*.index
 
 # OS
 .DS_Store
