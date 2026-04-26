@@ -14,19 +14,36 @@ Cleaning rules (identical for docs and queries):
 3. drop punctuation, except hyphens (``-``)
 4. drop English stopwords
 5. collapse whitespace
-
-No stemming, no lemmatization.
+6. WordNet lemmatize (verb → noun fallback; hyphenated / numeric tokens
+   are left untouched so ``f-1``, ``on-campus``, ``i-20`` survive intact)
 
 Run batch cleaning from the repo root::
 
-    python -m summerizer.utils.text_cleaning
+    python utils/text_cleaning.py
 """
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
+from nltk.stem import WordNetLemmatizer
+
+
+def _ensure_wordnet() -> None:
+    """Make sure the WordNet corpus is available; fetch it if missing."""
+    try:
+        from nltk.corpus import wordnet
+        wordnet.ensure_loaded()
+    except LookupError:
+        import nltk
+        nltk.download("wordnet", quiet=True)
+        nltk.download("omw-1.4", quiet=True)
+
+
+_ensure_wordnet()
+_LEMMATIZER = WordNetLemmatizer()
 
 IN_FILE = Path("data/processed/structured_text.csv")
 OUT_DIR = Path("data/processed")
@@ -186,17 +203,42 @@ def remove_stopwords(tokens: list[str]) -> list[str]:
     ]
 
 
+@lru_cache(maxsize=50_000)
+def lemmatize_token(tok: str) -> str:
+    """WordNet-lemmatize a single token; leave hyphenated/numeric tokens alone.
+
+    Tries verb POS first, then noun. Verb-first handles ``working -> work`` and
+    ``studies -> study``; noun fallback handles ``students -> student`` and
+    ``mice -> mouse``. Hyphenated tokens (``f-1``, ``on-campus``) and any
+    token containing a digit are passed through unchanged so domain-canonical
+    forms don't get mangled.
+    """
+    if not tok or "-" in tok or any(ch.isdigit() for ch in tok):
+        return tok
+    lemma = _LEMMATIZER.lemmatize(tok, pos="v")
+    if lemma == tok:
+        lemma = _LEMMATIZER.lemmatize(tok, pos="n")
+    return lemma
+
+
+def lemmatize_tokens(tokens: list[str]) -> list[str]:
+    return [lemmatize_token(t) for t in tokens]
+
+
 def clean_text(text: str) -> str:
-    """Shared core: normalize → tokenize → drop stopwords → rejoin.
+    """Shared core: normalize → tokenize → drop stopwords → lemmatize → rejoin.
 
     Used by both the corpus pipeline and :func:`clean_query_text` so the two
-    paths are guaranteed identical.
+    paths are guaranteed identical. Lemmatization runs last so stopword
+    removal still sees the original surface forms (e.g. ``doing`` is dropped
+    as a stopword instead of being collapsed to ``do`` first).
     """
     normalized = normalize_text(text)
     if not normalized:
         return ""
     tokens = normalized.split(" ")
     tokens = remove_stopwords(tokens)
+    tokens = lemmatize_tokens(tokens)
     return " ".join(tokens)
 
 
