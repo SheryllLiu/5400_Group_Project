@@ -37,7 +37,7 @@ def main(ctx: click.Context, log_level: str) -> None:
 
 @main.command()
 @click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind.")
-@click.option("--port", default=5000, show_default=True, help="Port to bind.")
+@click.option("--port", default=8080, show_default=True, help="Port to bind.")
 @click.option("--debug", is_flag=True, default=False, help="Enable Flask debug mode.")
 def serve(host: str, port: int, debug: bool) -> None:
     """Start the web demo (BM25 + dense hybrid retrieval + summarizer)."""

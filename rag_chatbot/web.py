@@ -4,7 +4,7 @@ Run from the repo root::
 
     python app.py
 
-Then open http://127.0.0.1:5000/ in a browser.
+Then open http://127.0.0.1:8080/ in a browser.
 
 The page has one input box, one submit button, and a results area. All
 retrieval logic lives in ``information_retreival.hybrid_retrieval.HybridRetriever``;

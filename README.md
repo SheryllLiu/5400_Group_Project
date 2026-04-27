@@ -1,5 +1,5 @@
-# F-1 Immigration Assistant
-
+# International Student Assistant Chatbot
+![](image/Interface.png)
 
 
 A beginner friendly web application (Flask app) that answers F-1 questions
@@ -22,7 +22,12 @@ grounded summary.
 - Robert George
 - Hima Bathula
 
-# Project Flow
+## Architecture
+
+![](image/pipeline.png)
+
+
+# System Flow
 
 1. The user enters a question through the Web App
 2. HybridRetreiver searches the corpus using BM25, Dense Retreival
@@ -31,103 +36,109 @@ grounded summary.
 5. The summarizer sends the query plus retreived evidence to Ollama
 6. The Web App displays a short summary, as well as the retreived documents + scores
 
-# Current Structure 
-- app.py is the Flask web app and UI
-- information_retreival/ Retrieval pipeline
-- Summarizer/utils/gamma4.py Ollama summarizer using gemma4:e2b
-- data/processed data, indices, and raw files 
+# Current Structure
+- `rag_chatbot/web.py` — Flask web app and UI
+- `rag_chatbot/information_retrieval/` — BM25, dense, and hybrid retrievers
+- `rag_chatbot/summarizer/gamma4.py` — Ollama summarizer using `gemma4:e2b`
+- `rag_chatbot/utils/` — crawling, parsing, cleaning, and index builders
+- `rag_chatbot/eval/` — IR and summarizer evaluation scripts
+- `src/international_student_assistant/cli.py` — `isa` command-line entry point
+- `tests/` — pytest unit tests
+- `data/` — raw HTML, processed CSVs, and built indices
 
-# Requirements
-- Python 3
-- Ollama
-- Model: gemma4:e2b
+# Setup
 
-## Python packages used by the project 
-- flask
-- requests
-- pandas
-- faiss-cpu
-- sentence-transformers
-  
-# Install Ollama
+## 1. Configure the Python environment with uv
+
+We use [uv](https://docs.astral.sh/uv/) to manage the virtual environment and dependencies.
+A single command installs everything declared in `pyproject.toml`, including the dev tools (pytest, ruff).
+
+```bash
+# install uv (skip if you already have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# from the repo root, create the venv and install all dependencies
+uv sync --extra dev
+```
+
+This creates `.venv/` and registers the `isa` CLI in editable mode. You don't need to activate the venv manually — every command below is prefixed with `uv run`, which executes inside the venv.
+
+## 2. Install Ollama and pull the summarizer model
+
+The summarizer calls a locally running Ollama server at `http://localhost:11434`. It must be installed and have the `gemma4:e2b` model pulled before running the web app or the summarizer evaluation.
+
+```bash
+# install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
 
-## Then pull the model: 
+# pull the model used by the summarizer
 ollama pull gemma4:e2b
 
-## You can test it with:
-ollama run gemma4:e2b
-
-## Install Python Dependencies
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install flask requests pandas faiss-cpu sentence-transformers
-
-# Run the App
-python3 app.py
-
-## Then open url
-
-
-
-
-
-
-
-
-
-## Team
-
-- TEAM_MEMBER_1 (full name)
-- TEAM_MEMBER_2 (full name)
-- TEAM_MEMBER_3 (full name)
-- TEAM_MEMBER_4 (full name)
-
-> Replace the placeholders above with the full names of all team members before
-> submission.
-
-## Scope
-
-**In scope** (F-1 students only):
-
-- Maintaining legal F-1 status
-- Employment authorization during study and around graduation (on-campus, CPT, OPT, STEM OPT)
-- Travel and re-entry compliance
-- F-1-relevant tax filing guidance **as provided by Georgetown OGS**
-
-**Out of scope** (by design):
-
-- J-1 students or scholars
-- H-1B / O-1 / green-card topics
-- Generic USCIS or IRS content
-- Personalized legal or tax advice
-- Any source outside the approved Georgetown OGS allowlist
-
-The corpus is restricted to a short allowlist of OGS URLs (see
-`src/f1_immigration_assistant/config.py`). Everything else is explicitly denied.
-
-## Architecture
-
+# (optional) sanity-check the model
+ollama run gemma4:e2b "hello"
 ```
-            approved OGS URLs
-                   │
-            crawler.py  ──►  raw HTML  ──►  parser.py  ──►  SourceDocument
-                                                                 │
-                                                          chunker.py
-                                                                 │
-                                                          DocumentChunk[]
-                                                                 │
-                       preprocessing.py  ────────────►   bm25_retriever.py
-                                                                 │
-                                              query_analysis.py  │
-                                                       │         │
-                                                       ▼         ▼
-                                                        pipeline.py
-                                                             │
-                                                     ┌───────┴───────┐
-                                                     ▼               ▼
-                                                evaluation.py   generator.py
-                                                                  (OpenAI)
 
+Ollama runs as a background service after installation. If it's not running, the summarizer falls back to returning the top retrieved document instead.
+
+# Run the Web App
+
+Start the Flask demo with the CLI:
+
+```bash
+uv run isa serve
+```
+
+Then open http://127.0.0.1:8080/ in a browser.
+
+To change the port, bind to all interfaces, or enable Flask's debug auto-reload:
+
+```bash
+uv run isa serve --host 0.0.0.0 --port 9000 --debug
+```
+
+# Run the Evaluations
+
+Two evaluation pipelines are wired into the same `isa evaluate` command:
+
+- **IR evaluation** — compares BM25 vs Hybrid retrieval on a gold query set, reporting P@5, R@5, MRR, Hit@5, and F1.
+- **Summarizer evaluation** — scores generated summaries against gold references using ROUGE-1/2/L and BERTScore.
+
+## Run both (default)
+
+```bash
+uv run isa evaluate
+```
+
+Runs IR first, then summarizer. **Requires Ollama to be running**, since the summarizer evaluation calls the model on every query.
+
+## Run only the IR evaluation
+
+No Ollama needed — pure retrieval quality on the gold queries.
+
+```bash
+uv run isa evaluate --no-summarizer
+```
+
+## Run only the summarizer evaluation
+
+Skips the BM25-vs-Hybrid IR comparison and only scores generated summaries.
+
+```bash
+uv run isa evaluate --no-ir
+```
+
+# Run the Tests
+
+The test suite uses `pytest` (installed via `uv sync --extra dev`):
+
+```bash
+uv run pytest
+```
+
+For per-test names and full output:
+
+```bash
+uv run pytest -v
+```
 
 
